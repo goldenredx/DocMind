@@ -72,8 +72,8 @@ Standard vector searches often fail to retrieve exact keyword matches (like spec
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/goldenredx/docmind.git
-   cd docmind
+   git clone https://github.com/goldenredx/DocMind.git
+   cd DocMind
    ```
 
 2. **Create and activate a virtual environment:**
@@ -98,5 +98,5 @@ Standard vector searches often fail to retrieve exact keyword matches (like spec
 
 5. **Run the application:**
    ```bash
-   streamlit run Doc-chatbot-aws.py
+   streamlit run DocMind.py
    ```
