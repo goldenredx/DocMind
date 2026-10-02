@@ -1,4 +1,5 @@
 import os
+import shutil
 import hashlib
 import tempfile
 import re
@@ -35,7 +36,7 @@ class Config:
     main_llm_model: str = "gemini-3.8-flash"     
     aws_region: str = "us-east-1"
     temperature: float = 0.3
-    max_tokens: int = 500
+    max_tokens: int = 1000
     chunk_size: int = 500
     chunk_overlap: int = 50
     retriever_k: int = 4
@@ -53,26 +54,16 @@ class SourceChunk(BaseModel):
     location: str
     matched_text: str
 
-class AnswerOnly(BaseModel):
-    answer: str
-
-    @field_validator("answer", mode="before")
-    @classmethod
-    def coerce_to_string(cls, v):
-        if isinstance(v, list):
-            return ", ".join(str(item) for item in v)
-        return str(v)
-
 class SummaryOnly(BaseModel):
     summary: str
 
 def clean_boilerplate_chunks(chunks):
-    """Drops noisy pages like table of contents, revisions, or translation lists."""
+    """Drops noisy pages like table of contents, revisions, or translation lists without length filtering."""
     cleaned = []
     noise_keywords = ["document revisions", "arabic", "brazilian portuguese", "simplified chinese", "table of contents"]
     for c in chunks:
         content_lower = c.page_content.lower()
-        if not any(nk in content_lower for nk in noise_keywords) and len(c.page_content.strip()) > 50:
+        if not any(nk in content_lower for nk in noise_keywords):
             cleaned.append(c)
     return cleaned
 
@@ -125,11 +116,22 @@ def split_with_location(docs, ext):
 @st.cache_resource
 def get_vectorstore():
     embeddings = HuggingFaceEmbeddings(model_name=config.embedding_model)
-    return Chroma(
-        collection_name="multi_docs",
-        embedding_function=embeddings,
-        persist_directory=config.persist_directory,
-    )
+    try:
+        return Chroma(
+            collection_name="multi_docs",
+            embedding_function=embeddings,
+            persist_directory=config.persist_directory,
+        )
+    except Exception as e:
+        log_main_error(e)
+        # Automatically wipe directory on dimension/corruption mismatch to prevent crash
+        if os.path.exists(config.persist_directory):
+            shutil.rmtree(config.persist_directory)
+        return Chroma(
+            collection_name="multi_docs",
+            embedding_function=embeddings,
+            persist_directory=config.persist_directory,
+        )
 
 def make_chunk_id(chunk):
     raw = f"{chunk.metadata['source_filename']}_{chunk.metadata['location']}_{chunk.page_content}"
@@ -292,13 +294,27 @@ if question := st.chat_input("Ask a question about your documents..."):
                 is_summary = any(kw in q_lower for kw in ["summarize", "summary", "tl;dr", "overview"])
                 
                 if is_summary:
-                    content = "\n\n".join(c.page_content for c in st.session_state.all_chunks)
+                    # Flexible per-document routing for summaries based on user query
+                    target_chunks = st.session_state.all_chunks
+                    mentioned_file = None
+                    for fn in st.session_state.known_filenames:
+                        fn_lower = fn.lower()
+                        fn_base = os.path.splitext(fn_lower)[0]
+                        if fn_lower in q_lower or fn_base in q_lower or any(part in q_lower for part in fn_base.split('-') if len(part) > 3):
+                            mentioned_file = fn
+                            break
+                    
+                    if mentioned_file:
+                        target_chunks = [c for c in st.session_state.all_chunks if c.metadata.get("source_filename") == mentioned_file]
+
+                    content = "\n\n".join(c.page_content for c in target_chunks)
                     max_chars = 15000
                     if len(content) > max_chars:
                         content = content[:max_chars] + "\n\n[Note: Content truncated for limits...]"
                     
                     structured_llm = llm.with_structured_output(SummaryOnly, method="json_mode")
-                    prompt = f"Summarize the following clearly:\n\n{content}\n\nRespond in JSON with a 'summary' field."
+                    file_label = f" for '{mentioned_file}'" if mentioned_file else ""
+                    prompt = f"Summarize the following document content{file_label} clearly:\n\n{content}\n\nRespond in JSON with a 'summary' field."
                     
                     try:
                         result = structured_llm.invoke(prompt)
@@ -308,10 +324,15 @@ if question := st.chat_input("Ask a question about your documents..."):
                         answer_text = "⚠️ An error occurred while generating the summary."
                     sources = []
                 else:
-                    if is_low_confidence(question, st.session_state.vectorstore, st.session_state.bm25_retriever):
-                        mq_retriever = MultiQueryRetriever.from_llm(retriever=st.session_state.ensemble_retriever, llm=llm)
-                        chunks = dedupe_chunks(mq_retriever.invoke(question))
-                    else:
+                    try:
+                        if is_low_confidence(question, st.session_state.vectorstore, st.session_state.bm25_retriever):
+                            mq_retriever = MultiQueryRetriever.from_llm(retriever=st.session_state.ensemble_retriever, llm=llm)
+                            chunks = dedupe_chunks(mq_retriever.invoke(question))
+                        else:
+                            chunks = dedupe_chunks(st.session_state.ensemble_retriever.invoke(question))
+                    except Exception as e:
+                        log_main_error(e)
+                        # Fallback safely to standard ensemble retriever if multi-query fails
                         chunks = dedupe_chunks(st.session_state.ensemble_retriever.invoke(question))
                     
                     context = "\n\n".join(
@@ -319,21 +340,37 @@ if question := st.chat_input("Ask a question about your documents..."):
                         for c in chunks
                     )
                     
-                    structured_llm = llm.with_structured_output(AnswerOnly, method="json_mode")
-                    prompt = f"Answer using only context:\n{context}\n\nQuestion: {question}\n\nRespond in JSON with an 'answer' field."
+                    prompt = f"""You are an expert technical assistant. Answer the user's question thoroughly, clearly, and professionally using ONLY the provided context below. Do not assume or extrapolate outside the text.
+
+Context:
+{context}
+
+Question: {question}
+
+Answer:"""
 
                     try:
-                        result = structured_llm.invoke(prompt)
-                        answer_text = result.answer
+                        response = llm.invoke(prompt)
+                        
+                        # Safely extract text whether content comes back as a string or a list of blocks
+                        raw_content = response.content if hasattr(response, "content") else str(response)
+                        if isinstance(raw_content, list):
+                            answer_text = "".join(
+                                item.get("text", "") if isinstance(item, dict) else str(item)
+                                for item in raw_content
+                            )
+                        else:
+                            answer_text = str(raw_content)
+                            
                     except Exception as e:
                         log_main_error(e)
-                        answer_text = "⚠️ Sorry, an error occurred while connecting to the model. Please check your API key or model name."
+                        answer_text = "⚠️ Sorry, an error occurred while generating the response. Please check your API key."
                     
                     sources = [
                         SourceChunk(
                             filename=c.metadata.get("source_filename", "unknown"),
                             location=c.metadata.get("location", "unknown"),
-                            matched_text=clean_source_text(c.page_content)[:250],  # Cleaned preview text
+                            matched_text=clean_source_text(c.page_content)[:250],
                         )
                         for c in chunks
                     ]
