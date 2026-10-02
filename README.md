@@ -94,7 +94,6 @@ Standard vector searches often fail to retrieve exact keyword matches (like spec
    Create a `.env` file in the root directory and add your Google Gemini API key:
    ```env
    GOOGLE_API_KEY=your_gemini_api_key_here
-   HUGGINGFACEHUB_API_KEY=your_huggingface_api_key_here
    ```
 
 5. **Run the application:**
