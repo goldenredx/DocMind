@@ -21,7 +21,8 @@ from langchain_community.document_loaders import (
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_huggingface import HuggingFaceEmbeddings
+# from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEndpointEmbeddings
 from langchain_classic.retrievers import EnsembleRetriever
 from langchain_classic.retrievers.multi_query import MultiQueryRetriever
 
@@ -32,7 +33,7 @@ load_dotenv()
 @dataclass
 class Config:
     persist_directory: str = "./db_multi"
-    embedding_model: str = "all-MiniLM-L6-v2" 
+    embedding_model: str = "BAAI/bge-base-en-v1.5" 
     main_llm_model: str = "gemini-3.8-flash"     
     aws_region: str = "us-east-1"
     temperature: float = 0.3
@@ -40,6 +41,9 @@ class Config:
     chunk_size: int = 500
     chunk_overlap: int = 50
     retriever_k: int = 4
+    context_chunks: int = 4          # chunks sent to the LLM per question
+    history_turns: int = 3           # previous Q&A pairs kept as chat memory
+    history_answer_chars: int = 300  # each remembered answer is trimmed to this length
     bm25_weight: float = 0.5
     vector_weight: float = 0.5
     bm25_threshold: float = 3.0
@@ -115,23 +119,18 @@ def split_with_location(docs, ext):
 
 @st.cache_resource
 def get_vectorstore():
-    embeddings = HuggingFaceEmbeddings(model_name=config.embedding_model)
-    try:
-        return Chroma(
-            collection_name="multi_docs",
-            embedding_function=embeddings,
-            persist_directory=config.persist_directory,
-        )
-    except Exception as e:
-        log_main_error(e)
-        # Automatically wipe directory on dimension/corruption mismatch to prevent crash
-        if os.path.exists(config.persist_directory):
-            shutil.rmtree(config.persist_directory)
-        return Chroma(
-            collection_name="multi_docs",
-            embedding_function=embeddings,
-            persist_directory=config.persist_directory,
-        )
+    embeddings = HuggingFaceEndpointEmbeddings(
+        model=config.embedding_model,
+        task="feature-extraction",
+        huggingfacehub_api_token=os.getenv("HUGGINGFACEHUB_API_KEY"),
+    )
+    if os.path.exists(config.persist_directory):
+        shutil.rmtree(config.persist_directory, ignore_errors=True)
+    return Chroma(
+        collection_name="multi_docs",
+        embedding_function=embeddings,
+        persist_directory=config.persist_directory,
+    )
 
 def make_chunk_id(chunk):
     raw = f"{chunk.metadata['source_filename']}_{chunk.metadata['location']}_{chunk.page_content}"
@@ -175,7 +174,7 @@ def is_low_confidence(question, vectorstore, bm25_retriever):
     vec_score = vec_results[0][1] if vec_results else 1.0
     return (bm25_score < config.bm25_threshold) and (vec_score > config.vector_distance_threshold)
 
-def dedupe_chunks(chunks, limit=6):
+def dedupe_chunks(chunks, limit=config.context_chunks):
     seen, unique = set(), []
     for c in chunks:
         key = (c.metadata.get("source_filename"), c.page_content)
@@ -183,6 +182,41 @@ def dedupe_chunks(chunks, limit=6):
             seen.add(key)
             unique.append(c)
     return unique[:limit]
+
+# ----------------------------- CHAT MEMORY -----------------------------
+FOLLOW_UP_PATTERN = re.compile(
+    r"\b(it|its|that|this|those|these|they|them|their|former|latter|above|earlier|previous|same)\b"
+    r"|^\s*(and|also|what about|how about|why|so)\b",
+    re.IGNORECASE,
+)
+
+def get_recent_turns(messages, n_turns=None):
+    """Return the last n (question, answer) pairs, skipping failed answers."""
+    n_turns = n_turns or config.history_turns
+    turns = []
+    for i in range(len(messages) - 1):
+        user_msg, bot_msg = messages[i], messages[i + 1]
+        if (
+            user_msg["role"] == "user"
+            and bot_msg["role"] == "assistant"
+            and not bot_msg["content"].startswith("⚠️")
+        ):
+            turns.append((user_msg["content"], bot_msg["content"]))
+    return turns[-n_turns:]
+
+def format_history(turns):
+    """Turn recent (question, answer) pairs into a short text block for the prompt."""
+    lines = []
+    for q, a in turns:
+        short = a[:config.history_answer_chars] + ("..." if len(a) > config.history_answer_chars else "")
+        lines.append(f"User: {q}\nAssistant: {short}")
+    return "\n\n".join(lines)
+
+def build_retrieval_query(question, turns):
+    """For follow-ups like 'and what about it?', prepend the previous question so search has keywords."""
+    if turns and FOLLOW_UP_PATTERN.search(question):
+        return f"{turns[-1][0]} {question}"
+    return question
 
 # ----------------------------- LLM BUILDER -----------------------------
 @st.cache_resource
@@ -239,7 +273,7 @@ with st.sidebar:
                             chunks = split_with_location(docs, ext)
                             ids = [make_chunk_id(c) for c in chunks]
                             
-                            st.write("🤗 Generating local HuggingFace embeddings...")
+                            st.write("🤗 Generating HuggingFace API embeddings...")
                             st.session_state.vectorstore.add_documents(chunks, ids=ids)
                             
                             st.session_state.all_chunks.extend(chunks)
@@ -284,6 +318,9 @@ if question := st.chat_input("Ask a question about your documents..."):
     if not st.session_state.known_filenames:
         st.warning("Please upload at least one document using the sidebar first.")
     else:
+        recent_turns = get_recent_turns(st.session_state.messages)
+        history_text = format_history(recent_turns)
+        retrieval_query = build_retrieval_query(question, recent_turns)
         st.session_state.messages.append({"role": "user", "content": question})
         with st.chat_message("user"):
             st.markdown(question)
@@ -325,29 +362,33 @@ if question := st.chat_input("Ask a question about your documents..."):
                     sources = []
                 else:
                     try:
-                        if is_low_confidence(question, st.session_state.vectorstore, st.session_state.bm25_retriever):
+                        if is_low_confidence(retrieval_query, st.session_state.vectorstore, st.session_state.bm25_retriever):
                             mq_retriever = MultiQueryRetriever.from_llm(retriever=st.session_state.ensemble_retriever, llm=llm)
-                            chunks = dedupe_chunks(mq_retriever.invoke(question))
+                            chunks = dedupe_chunks(mq_retriever.invoke(retrieval_query))
                         else:
-                            chunks = dedupe_chunks(st.session_state.ensemble_retriever.invoke(question))
+                            chunks = dedupe_chunks(st.session_state.ensemble_retriever.invoke(retrieval_query))
                     except Exception as e:
                         log_main_error(e)
                         # Fallback safely to standard ensemble retriever if multi-query fails
-                        chunks = dedupe_chunks(st.session_state.ensemble_retriever.invoke(question))
+                        chunks = dedupe_chunks(st.session_state.ensemble_retriever.invoke(retrieval_query))
                     
                     context = "\n\n".join(
                         f"[Source: {c.metadata.get('source_filename')}, {c.metadata.get('location')}]\n{c.page_content}"
                         for c in chunks
                     )
                     
-                    prompt = f"""You are an expert technical assistant. Answer the user's question thoroughly, clearly, and professionally using ONLY the provided context below. Do not assume or extrapolate outside the text.
+                    history_block = (
+                        "\n\nConversation so far (use it only to understand what the question refers to):\n" + history_text
+                        if history_text else ""
+                    )
+                    prompt = f"""You are an expert technical assistant. Answer the user's question thoroughly, clearly, and professionally using ONLY the provided context below. Do not assume or extrapolate outside the text.{history_block}
 
-Context:
-{context}
+                                Context:
+                                {context}
 
-Question: {question}
+                                Question: {question}
 
-Answer:"""
+                                Answer:"""
 
                     try:
                         response = llm.invoke(prompt)
@@ -364,7 +405,7 @@ Answer:"""
                             
                     except Exception as e:
                         log_main_error(e)
-                        answer_text = "⚠️ Sorry, an error occurred while generating the response. Please check your API key."
+                        answer_text = "⚠️ The model is busy right now. Please try again in a few seconds."
                     
                     sources = [
                         SourceChunk(
