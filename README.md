@@ -4,6 +4,8 @@ A **Hybrid Retrieval-Augmented Generation (RAG)** web app built with **Streamlit
 
 This edition computes embeddings through the **Hugging Face Inference API** and generates answers with **Gemini**, so it needs **no GPU and no local model download**. That keeps hosting cheap: it runs on a single AWS free-tier `t3.micro`, reached through an SSM tunnel with no open ports.
 
+> 📘 **Engineering Documentation:** For an in-depth breakdown of architectural decisions, technical failures, root-cause analyses, and zero-inbound AWS deployment steps, read the **[DocMind Engineering Build Log (PDF)](https://github.com/goldenredx/DocMind/blob/main/docs/DocMind_Engineering_Build_Log_.pdf)**.
+
 <!-- 🎥 Demo video: add link here -->
 
 ---
@@ -89,6 +91,8 @@ Fewer context chunks means fewer tokens per question, but too few can miss answe
 ├── DocMind_api.py          # Streamlit application
 ├── requirements-api.txt    # Pinned dependencies
 ├── .gitignore              # Keeps .env and local DBs out of Git
+├── docs/                   # Documentation & Build Logs
+│   └── DocMind_Engineering_Build_Log_.pdf  # Detailed engineering post-mortem
 └── db_multi/               # Vector store created at runtime (not committed)
 ```
 
