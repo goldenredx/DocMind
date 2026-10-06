@@ -6,8 +6,6 @@ This edition computes embeddings through the **Hugging Face Inference API** and 
 
 > 📘 **Engineering Documentation:** For an in-depth breakdown of architectural decisions, technical failures, root-cause analyses, and zero-inbound AWS deployment steps, read the **[DocMind Engineering Build Log (PDF)](https://github.com/goldenredx/DocMind/blob/main/docs/DocMind_Engineering_Build_Log_.pdf)**.
 
-<!-- 🎥 Demo video: add link here -->
-
 ---
 
 ## 🚀 What's New in This Edition
